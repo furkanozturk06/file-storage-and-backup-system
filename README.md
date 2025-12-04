@@ -76,5 +76,5 @@ Log dosyaları `.txt` uzantılıdır ve aşağıdaki bilgileri içerir:
 
 ## 👨‍💻 Geliştirici Bilgileri
 
-* **Ad Soyad:** [Furkan Öztürk]
+* **Ad Soyad:** Furkan Öztürk
 * **Proje:** Dosya Depolama ve Yedekleme Sistemi
