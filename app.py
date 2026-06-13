@@ -1,7 +1,7 @@
 import os
+import re
 import sys
 import shutil
-import hashlib
 import datetime
 from threading import Thread
 from watchdog.observers import Observer
@@ -12,6 +12,70 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLineEdit, QPushButton,
                              QFileDialog, QVBoxLayout, QDialog, QProgressBar,
                              QAbstractItemView, QListWidgetItem, QInputDialog)
 from ui import Ui_MainWindow
+
+# Sifre tabanli anahtar turetme (KDF). Tercihen argon2id, yoksa bcrypt.
+# Her ikisi de tuzlu ve yavas hash uretir; ciktinin kendisi tuzu icerir.
+try:
+    from argon2 import PasswordHasher
+    _ph = PasswordHasher()
+
+    def hash_password(password):
+        return _ph.hash(password)
+
+    def verify_password(password, stored_hash):
+        # Hatali/eski (ornegin eski SHA-256) kayitlar dogrulamayi gecemez;
+        # crash yerine guvenli sekilde False dondurulur.
+        try:
+            return _ph.verify(stored_hash, password)
+        except Exception:
+            return False
+
+    _PASSWORD_BACKEND = "argon2"
+except ImportError:
+    import bcrypt
+
+    def hash_password(password):
+        return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+    def verify_password(password, stored_hash):
+        try:
+            return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
+        except Exception:
+            return False
+
+    _PASSWORD_BACKEND = "bcrypt"
+
+# Kullanici / takim adlari icin allowlist. Sadece harf, rakam, alt cizgi ve tire.
+# Bu ayni zamanda path traversal (.. / \) ve kayit-ayraci (',' ':' yeni satir)
+# enjeksiyonunu da engeller.
+_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_MAX_NAME_LENGTH = 64
+
+
+def is_valid_name(name):
+    """Kullanici/takim adinin allowlist'e uydugunu dogrula."""
+    if not name or len(name) > _MAX_NAME_LENGTH:
+        return False
+    return bool(_NAME_PATTERN.match(name))
+
+
+def safe_join_within(base_dir, *parts):
+    """Verilen parcalari base_dir altinda guvenli sekilde birlestir.
+
+    Olusan yol realpath/commonpath ile taban dizine hapsedilir; disari
+    cikmaya calisan (path traversal) her girdi icin ValueError firlatilir.
+    """
+    base_real = os.path.realpath(base_dir)
+    target = os.path.realpath(os.path.join(base_real, *parts))
+    if os.path.commonpath([base_real, target]) != base_real:
+        raise ValueError("Path traversal attempt detected")
+    return target
+
+
+# Kullanici verisinin yazilabilecegi taban dizinler. Tum dosya yollari
+# bu dizinlerin altina hapsedilir.
+BACKUPS_DIR = "backups"
+TEAM_UPLOADS_DIR = "team_uploads"
 
 class FolderSyncHandler(FileSystemEventHandler):
     def __init__(self, sync_callback):
@@ -29,8 +93,9 @@ class MainWindow(QMainWindow):
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
 
-        self.current_user = None 
+        self.current_user = None
         self.current_team = None
+        self.current_role = None
         self.dynamic_widgets = []
         self.user_inputs = {}
 
@@ -78,10 +143,39 @@ class MainWindow(QMainWindow):
         self.ui.admin_user_data_btn.clicked.connect(self.show_user_data)
         self.ui.admin_team_file_btn.clicked.connect(self.show_team_files)
 
+        # Kayit sirasinda Admin rolu self-secimi kaldirildi; secenegi gizle.
+        if hasattr(self.ui, "rd_admin"):
+            self.ui.rd_admin.setChecked(False)
+            self.ui.rd_admin.hide()
+
     def show_first_screen(self):
         for widget in self.dynamic_widgets:
                 widget.hide()
+        # Oturum durumunu sifirla; yetki kontrolleri current_role'e dayanir.
+        self.current_user = None
+        self.current_team = None
+        self.current_role = None
         self.ui.stackedWidget.setCurrentIndex(0)
+
+    def require_admin(self):
+        """Admin yetkisi zorunlu kil. Aksi halde False dondur ve uyari goster."""
+        if self.current_role == "Admin":
+            return True
+        QMessageBox.warning(self, "Access Denied", "You are not authorized to perform this action.")
+        self.log_event(
+            category="Authorization",
+            operation_code="ADMIN_ACCESS_DENIED",
+            status_code="FAILED",
+            user=self.current_user,
+            message="Non-admin attempted an admin-only action"
+        )
+        return False
+
+    def get_current_backup_folder(self):
+        """Mevcut kullaniciya ait, taban dizine hapsedilmis yedek klasorunu dondur."""
+        if not self.current_user or not is_valid_name(self.current_user):
+            raise ValueError("Invalid current user")
+        return safe_join_within(BACKUPS_DIR, self.current_user)
 
     def show_register_screen(self):
         self.ui.stackedWidget.setCurrentIndex(1)
@@ -121,9 +215,15 @@ class MainWindow(QMainWindow):
             self.ui.reg_lbl.setText("Please enter a username and password!")
             return
 
+        # Allowlist dogrulamasi: path traversal ve kayit-ayraci enjeksiyonunu engeller.
+        if not is_valid_name(username):
+            self.ui.reg_lbl.setText(
+                "Username may only contain letters, digits, '_' and '-' (max 64 chars)."
+            )
+            return
+
+        # Kayit sirasinda Admin rolu self-secimi yok; herkes User olarak kaydolur.
         role = "User"
-        if self.ui.rd_admin.isChecked():
-            role = "Admin"
 
         try:
             with open('users.txt', 'r') as f:
@@ -137,7 +237,7 @@ class MainWindow(QMainWindow):
         except FileNotFoundError:
             pass
 
-        hashed_password = hashlib.sha256(password.encode()).hexdigest()
+        hashed_password = hash_password(password)
         quota = 500
 
         with open('users.txt', 'a') as f:
@@ -163,16 +263,15 @@ class MainWindow(QMainWindow):
             )
             return
 
-        hashed_password = hashlib.sha256(password.encode()).hexdigest()
-
         try:
             with open('users.txt', 'r') as f:
                 users = f.readlines()
 
             for user in users:
                 stored_role, stored_username, stored_password, stored_quota = user.strip().split(',')
-                if username == stored_username and hashed_password == stored_password:
+                if username == stored_username and verify_password(password, stored_password):
                     self.current_user = username
+                    self.current_role = stored_role
                     self.current_quota = stored_quota
                     self.current_team = self.get_user_team(username)
                     self.load_synced_folders()
@@ -201,7 +300,7 @@ class MainWindow(QMainWindow):
                         self.ui.login_ps_text.clear()
                     return
                 if stored_role == "User":
-                    if username == stored_username and not hashed_password == stored_password:
+                    if username == stored_username and not verify_password(password, stored_password):
                         self.log_event(
                             category="Login",
                             operation_code="USER_LOGIN",
@@ -318,7 +417,7 @@ class MainWindow(QMainWindow):
             for user in users:
                 role, stored_username, stored_password,quota = user.strip().split(',')
                 if stored_username == self.current_user:
-                    hashed_password = hashlib.sha256(new_password.encode()).hexdigest()
+                    hashed_password = hash_password(new_password)
                     updated_users.append(f"{role},{stored_username},{hashed_password},{quota}\n")
                 else:
                     updated_users.append(user)
@@ -364,6 +463,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Notification file not found!")
 
     def toggle_admin_notifications(self):
+        if not self.require_admin():
+            return
         if hasattr(self, 'requests_list') and self.requests_list.isVisible():
             self.requests_list.hide()
             self.approve_request_btn.hide()
@@ -396,6 +497,8 @@ class MainWindow(QMainWindow):
             self.reject_request_btn.show()
 
     def approve_password_request(self):
+        if not self.require_admin():
+            return
         selected_item = self.requests_list.currentItem()
         if not selected_item:
             QMessageBox.warning(self, "Error", "Please select a notification.")
@@ -413,6 +516,8 @@ class MainWindow(QMainWindow):
         self.requests_list.takeItem(self.requests_list.currentRow())
 
     def reject_password_request(self):
+        if not self.require_admin():
+            return
         selected_item = self.requests_list.currentItem()
         if not selected_item:
             QMessageBox.warning(self, "Error", "Please select a notification.")
@@ -452,6 +557,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Notification file not found!")
 
     def show_user_list(self):
+        if not self.require_admin():
+            return
         user_list_window = QWidget()
         user_list_window.setWindowTitle("User List and Quotas")
         layout = QFormLayout()
@@ -484,6 +591,8 @@ class MainWindow(QMainWindow):
 
     def save_user_quota_changes(self):
         """Save user quota changes."""
+        if not self.require_admin():
+            return
         try:
             with open('users.txt', 'r') as f:
                 users = f.readlines()
@@ -514,7 +623,14 @@ class MainWindow(QMainWindow):
 
     def view_files(self, username):
         """View files uploaded by the user and open them on double-click."""
-        user_folder = os.path.join("backups", username)
+        if not is_valid_name(username):
+            QMessageBox.warning(self, "Error", "Invalid user name.")
+            return
+        try:
+            user_folder = safe_join_within(BACKUPS_DIR, username)
+        except ValueError:
+            QMessageBox.warning(self, "Error", "Invalid user name.")
+            return
         if not os.path.exists(user_folder):
             QMessageBox.warning(self, "Error", "No files have been uploaded.")
             return
@@ -570,6 +686,13 @@ class MainWindow(QMainWindow):
         """Display the screen for creating a new team."""
         team_name, ok = QInputDialog.getText(self, "Team Name", "Enter a team name:")
         if ok and team_name:
+            # Allowlist: path traversal ve kayit-ayraci (':' ',' yeni satir) enjeksiyonunu engeller.
+            if not is_valid_name(team_name):
+                QMessageBox.warning(
+                    self, "Error",
+                    "Team name may only contain letters, digits, '_' and '-' (max 64 chars)."
+                )
+                return
             if self.check_if_user_in_team():
                 QMessageBox.warning(self, "Error", "You are already a member of a team. You cannot create another one.")
                 return
@@ -823,16 +946,31 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "You are not a member of any team!")
             return
 
+        if not is_valid_name(username) or not is_valid_name(user_team):
+            QMessageBox.warning(self, "Error", "Invalid user or team name.")
+            return
+
         selected_items = self.file_list_widget.selectedItems()
 
         if not selected_items:
             QMessageBox.warning(self, "Error", "No files selected for sharing.")
             return
 
+        try:
+            user_folder = safe_join_within(BACKUPS_DIR, username)
+            team_folder = safe_join_within(TEAM_UPLOADS_DIR, user_team)
+        except ValueError:
+            QMessageBox.warning(self, "Error", "Invalid user or team name.")
+            return
+
         for item in selected_items:
             file_name = item.text().split(' - ')[0]
-            user_folder = os.path.join("backups", username)
-            file_path = os.path.join(user_folder, file_name)
+            try:
+                file_path = safe_join_within(user_folder, file_name)
+                dest_path = safe_join_within(team_folder, file_name)
+            except ValueError:
+                QMessageBox.warning(self, "Error", f"Invalid file name: {file_name}")
+                continue
 
             if not os.path.exists(file_path):
                 QMessageBox.warning(self, "Error", f"{file_name} not found!")
@@ -845,10 +983,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Error", f"The file {file_size:.2f} MB exceeds the available quota of {remaining_quota:.2f} MB.")
                 return
 
-            team_folder = os.path.join("team_uploads", user_team)
             os.makedirs(team_folder, exist_ok=True)
-
-            dest_path = os.path.join(team_folder, file_name)
 
             try:
                 with open(file_path, 'rb') as src_file, open(dest_path, 'wb') as dest_file:
@@ -886,6 +1021,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "You are not a member of any team!")
             return
 
+        if not is_valid_name(user_team):
+            QMessageBox.warning(self, "Error", "Invalid team name.")
+            return
+
         team_files = []
         try:
             with open('team_files.txt', 'r') as f:
@@ -916,8 +1055,12 @@ class MainWindow(QMainWindow):
 
         def open_team_file(item):
             file_name = item.text()
-            team_folder = os.path.join("team_uploads", user_team)
-            file_path = os.path.join(team_folder, file_name)
+            try:
+                team_folder = safe_join_within(TEAM_UPLOADS_DIR, user_team)
+                file_path = safe_join_within(team_folder, file_name)
+            except ValueError:
+                QMessageBox.warning(self, "Error", "Invalid file path.")
+                return
             if os.path.exists(file_path):
                 try:
                     os.startfile(file_path)
@@ -952,7 +1095,11 @@ class MainWindow(QMainWindow):
         self.sync_folders.append(folder_path)
         self.save_synced_folders()
 
-        backup_folder = os.path.join("backups", self.current_user)
+        try:
+            backup_folder = self.get_current_backup_folder()
+        except ValueError:
+            QMessageBox.warning(self, "Error", "Invalid user session.")
+            return
         os.makedirs(backup_folder, exist_ok=True)
 
         self.sync_folder(folder_path, backup_folder)
@@ -1053,14 +1200,25 @@ class MainWindow(QMainWindow):
 
     def perform_scheduled_sync(self):
         """Perform scheduled synchronization."""
+        if not self.current_user or not is_valid_name(self.current_user):
+            return
+        try:
+            backup_folder = self.get_current_backup_folder()
+        except ValueError:
+            return
         for folder_path in self.sync_folders:
-            backup_folder = os.path.join("backups", self.current_user)
             self.sync_folder(folder_path, backup_folder)
+
+    def synced_folders_path(self):
+        """Mevcut kullaniciya ait sync-listesi dosyasinin guvenli yolunu dondur."""
+        if not self.current_user or not is_valid_name(self.current_user):
+            raise ValueError("Invalid current user")
+        return safe_join_within(".", f"{self.current_user}_synced_folders.txt")
 
     def save_synced_folders(self):
         """Save synchronized folders to a file."""
         try:
-            with open(f"{self.current_user}_synced_folders.txt", "w") as f:
+            with open(self.synced_folders_path(), "w") as f:
                 for folder in self.sync_folders:
                     f.write(folder + "\n")
         except Exception as e:
@@ -1069,11 +1227,11 @@ class MainWindow(QMainWindow):
     def load_synced_folders(self):
         """Load synchronized folders from a file."""
         try:
-            with open(f"{self.current_user}_synced_folders.txt", "r") as f:
+            with open(self.synced_folders_path(), "r") as f:
                 self.sync_folders = [line.strip() for line in f.readlines()]
 
+            backup_folder = self.get_current_backup_folder()
             for folder in self.sync_folders:
-                backup_folder = os.path.join("backups", self.current_user)
                 os.makedirs(backup_folder, exist_ok=True)
 
                 if not self.sync_observer:
@@ -1217,6 +1375,8 @@ class MainWindow(QMainWindow):
 
     def show_log_files(self):
         """List log files and open them on double-click."""
+        if not self.require_admin():
+            return
         log_folder = "logs"
         if not os.path.exists(log_folder):
             QMessageBox.warning(self, "Error", "Log files not found.")
@@ -1261,6 +1421,8 @@ class MainWindow(QMainWindow):
 
     def show_user_files(self):
         """List user files and open them on double-click."""
+        if not self.require_admin():
+            return
         user_folders = "backups"
         if not os.path.exists(user_folders):
             QMessageBox.warning(self, "Error", "User folders not found.")
@@ -1307,6 +1469,8 @@ class MainWindow(QMainWindow):
 
     def show_user_data(self):
         """Display usernames and hashed passwords."""
+        if not self.require_admin():
+            return
         try:
             with open('users.txt', 'r') as f:
                 users = f.readlines()
@@ -1339,6 +1503,8 @@ class MainWindow(QMainWindow):
 
     def show_team_files(self):
         """List team files and open them on double-click."""
+        if not self.require_admin():
+            return
         team_folder = "team_uploads"
         if not os.path.exists(team_folder):
             QMessageBox.warning(self, "Error", "Team files not found.")

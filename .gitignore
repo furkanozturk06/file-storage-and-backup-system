@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Calisma zamani uretilen hassas veri dosyalari (sifre hash'leri, kullanici verisi)
+users.txt
+notifications.txt
+teams.txt
+team_files.txt
+failed_login_attempts.txt
+password_change_requests.txt
+*_synced_folders.txt
+
+# Kullanici/takim yedekleri ve loglar
+backups/
+team_uploads/
+logs/
+
+# Ortam degiskenleri / yerel ayarlar
+.env

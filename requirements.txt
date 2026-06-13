@@ -1,0 +1,6 @@
+PyQt5
+watchdog
+# Sifre hashleme icin tuzlu, yavas KDF. argon2-cffi tercih edilir;
+# kurulu degilse uygulama otomatik olarak bcrypt'e duser.
+argon2-cffi
+bcrypt
